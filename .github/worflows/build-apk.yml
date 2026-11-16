@@ -31,7 +31,7 @@ jobs:
         shell: bash
         run: |
           set -e
-          ZIP="Matibatidos_RC6_EXCEL_RENDIMIENTO_CORREGIDO.zip"
+          ZIP="Matibatidos_RC6_LISTO_PARA_GITHUB.zip"
 
           if [ ! -f "$ZIP" ]; then
             echo "ERROR: No se encontró $ZIP en la raíz del repositorio."
