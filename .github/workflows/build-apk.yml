@@ -15,7 +15,7 @@ jobs:
   build:
     name: Preparar y compilar APK RC6
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 45
 
     steps:
       - name: Descargar repositorio
@@ -34,9 +34,9 @@ jobs:
           set -Eeuo pipefail
 
           WORK_DIR="$GITHUB_WORKSPACE/_matibatidos_build"
-          mkdir -p "$WORK_DIR/unpacked" "$WORK_DIR/processed"
+          mkdir -p "$WORK_DIR/unpacked"
 
-          echo "Archivos recibidos en el repositorio:"
+          echo "Contenido inicial del repositorio:"
           ls -lah "$GITHUB_WORKSPACE"
 
           shopt -s nullglob
@@ -44,26 +44,24 @@ jobs:
 
           if [ ${#ROOT_ZIPS[@]} -gt 0 ]; then
             for archive in "${ROOT_ZIPS[@]}"; do
-              echo "Extrayendo archivo exterior: $(basename "$archive")"
+              echo "Extrayendo ZIP: $(basename "$archive")"
               unzip -oq "$archive" -d "$WORK_DIR/unpacked"
             done
           else
-            echo "No hay ZIP en la raíz. Se buscará un proyecto Android ya descomprimido."
+            echo "No se encontraron ZIP en la raíz; se buscará un proyecto ya descomprimido."
           fi
 
+          # Extraer archivos ZIP anidados, hasta cinco niveles.
           for level in 1 2 3 4 5; do
             mapfile -d '' NESTED_ZIPS < <(
-              find "$WORK_DIR/unpacked" -type f \
-                \( -iname '*.zip' \) -print0 2>/dev/null || true
+              find "$WORK_DIR/unpacked" -type f -iname '*.zip' -print0 2>/dev/null || true
             )
 
-            if [ ${#NESTED_ZIPS[@]} -eq 0 ]; then
-              break
-            fi
+            [ ${#NESTED_ZIPS[@]} -gt 0 ] || break
 
             for archive in "${NESTED_ZIPS[@]}"; do
-              destination="${archive%.zip}_extraido"
-              echo "Extrayendo ZIP anidado (nivel $level): $(basename "$archive")"
+              destination="${archive%.*}_extraido"
+              echo "Extrayendo ZIP interno (nivel $level): $(basename "$archive")"
               mkdir -p "$destination"
               unzip -oq "$archive" -d "$destination"
               mv "$archive" "$archive.procesado"
@@ -71,6 +69,7 @@ jobs:
           done
 
           PROJECT_DIR=""
+
           while IFS= read -r -d '' settings_file; do
             candidate="$(dirname "$settings_file")"
 
@@ -89,14 +88,14 @@ jobs:
           if [ -z "$PROJECT_DIR" ]; then
             echo "::error::No se encontró la raíz del proyecto Android."
             echo "Se esperaba settings.gradle junto a la carpeta app/."
-            find "$GITHUB_WORKSPACE" -maxdepth 8 -type f | head -200
+            find "$GITHUB_WORKSPACE" -maxdepth 9 -type f | head -250
             exit 1
           fi
 
-          echo "Proyecto Android localizado en: $PROJECT_DIR"
+          echo "Proyecto localizado: $PROJECT_DIR"
           echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
 
-      - name: Verificar identidad y estructura de Matibatidos RC6
+      - name: Verificar estructura e identidad de Matibatidos RC6
         working-directory: ${{ steps.locate.outputs.project_dir }}
         shell: bash
         run: |
@@ -111,14 +110,14 @@ jobs:
           [ -f "$GRADLE_FILE" ] || GRADLE_FILE="app/build.gradle.kts"
 
           if ! grep -Eq "applicationId[[:space:]]*['\"]com\.matibatidos\.pos\.rc6['\"]" "$GRADLE_FILE"; then
-            echo "::error::El applicationId no es com.matibatidos.pos.rc6. Se detiene para proteger la APK de producción."
+            echo "::error::El applicationId no coincide con com.matibatidos.pos.rc6. Se detiene para proteger la APK de producción."
             exit 1
           fi
 
           echo "Identificador independiente verificado."
           grep -nE "applicationId|versionCode|versionName|compileSdk|minSdk|targetSdk" "$GRADLE_FILE" || true
 
-      - name: Preparar bibliotecas JavaScript requeridas por la aplicación
+      - name: Preparar bibliotecas JavaScript de Excel y gráficos
         working-directory: ${{ steps.locate.outputs.project_dir }}
         shell: bash
         run: |
@@ -142,18 +141,43 @@ jobs:
           test -s "$ASSETS/chart.umd.min.js"
           ls -lh "$ASSETS/xlsx.full.min.js" "$ASSETS/chart.umd.min.js"
 
-      - name: Configurar Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Instalar plataformas y herramientas Android
+      - name: Configurar Android SDK desde GitHub Runner
         shell: bash
         run: |
           set -Eeuo pipefail
-          sdkmanager --licenses </dev/null || true
-          sdkmanager \
+
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+
+          if [ ! -d "$SDK_ROOT" ]; then
+            echo "::error::No se encontró Android SDK en $SDK_ROOT."
+            exit 1
+          fi
+
+          SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f -name sdkmanager -print -quit 2>/dev/null || true)"
+
+          if [ -z "$SDKMANAGER" ]; then
+            echo "::error::No se encontró sdkmanager dentro de $SDK_ROOT/cmdline-tools."
+            find "$SDK_ROOT" -maxdepth 4 -type f -name sdkmanager -print || true
+            exit 1
+          fi
+
+          SDK_BIN="$(dirname "$SDKMANAGER")"
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "$SDK_BIN" >> "$GITHUB_PATH"
+          echo "$SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
+
+          echo "SDK detectado: $SDK_ROOT"
+          "$SDKMANAGER" --version
+
+          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses || true
+
+          "$SDKMANAGER" --sdk_root="$SDK_ROOT" \
             "platforms;android-35" \
             "build-tools;35.0.0" \
             "platform-tools"
+
+          echo "Android SDK preparado correctamente."
 
       - name: Configurar Gradle 8.9
         uses: gradle/actions/setup-gradle@v4
@@ -178,17 +202,17 @@ jobs:
           APK_PATH="$(find app/build/outputs/apk/debug -type f -name '*.apk' -print -quit)"
 
           if [ -z "$APK_PATH" ] || [ ! -s "$APK_PATH" ]; then
-            echo "::error::La compilación terminó pero no se encontró el archivo APK."
+            echo "::error::No se encontró una APK válida después de compilar."
             find app/build/outputs -maxdepth 6 -type f -print 2>/dev/null || true
             exit 1
           fi
 
-          echo "APK generada correctamente:"
+          echo "APK generada:"
           ls -lh "$APK_PATH"
           sha256sum "$APK_PATH"
           echo "apk_path=$APK_PATH" >> "$GITHUB_OUTPUT"
 
-      - name: Publicar APK como artefacto descargable
+      - name: Publicar APK descargable
         uses: actions/upload-artifact@v4
         with:
           name: Matibatidos-POS-RC6-DELIVERY-1.2.1
